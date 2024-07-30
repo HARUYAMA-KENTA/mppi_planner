@@ -1,3 +1,4 @@
+
 #include "mppi_path/mppi.h"
 
 MPPIPlanner::MPPIPlanner()
@@ -6,7 +7,7 @@ MPPIPlanner::MPPIPlanner()
     // Series_;
     // Series_eig;
     // Series_eig_vec;
-
+    // ------publisher and subscriber -------
     ROS_INFO("MPPI planner");
     optim_velocity_pub_ = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 1);
     optim_path_pub_ = nh_.advertise<nav_msgs::Path>("/optimal_path",1);
@@ -16,36 +17,41 @@ MPPIPlanner::MPPIPlanner()
     // amcl_sub_ = nh_.subscribe("/amcl_pose",1,&MPPIPlanner::amcl_callback, this);
     model_sub_ = nh_.subscribe("/gazebo/model_states",1,&MPPIPlanner::model_callback, this);
     // local_map_sub_ = nh_.subscribe("/local_map", 1, &MPPIPlanner::local_map_callback, this);
-    // path_sub_ = nh_.subscribe("/global_path",1,&MPPIPlanner::path_callback, this); 
     // path_sub_ = nh_.subscribe("/move_base/NavfnROS/plan",1,&MPPIPlanner::path_callback, this); 
-    // path_sub_ = nh_.subscribe("/nav_path",1,&MPPIPlanner::path_callback, this); 
+    path_sub_ = nh_.subscribe("/nav_path",1,&MPPIPlanner::path_callback, this); 
     target_point_sub_ = nh_.subscribe("move_base_simple/goal", 1, &MPPIPlanner::target_point_callback,this);
     // scan_sub_ = nh_.subscribe("/scan", 1, &MPPIPlanner::scan_callback, this);
-    // for noise epsilon
+
     //-----set params-----
-    sigma << 1.0, 0.0,
-             0.0, 1.0;
+    // noise param sigma
+    sigma << 0.25, 0.0,
+             0.0, 0.5;
     inv_sigma = sigma.inverse(); 
+    // clip control param
     max_vel = 0.4;
-    double eta=0;
     max_omega = 0.5;
-    // lim_omega = 0.5;
-    min_vel = 0.0;
-    lambda = 2.0;
-    inv_lambda = 1.0/lambda;
-    alpha = 0.3;
-    gamma = lambda * (1-alpha);
+    min_vel = -0.1;
     dt = 0.05;
+
+    lambda = 1.0;
+    inv_lambda = 1.0/lambda;
+    alpha = 0.2;
+    gamma = lambda * (1-alpha);
     start_call = false;
+    path_receive_flg = false;
+    
     goal_threshold = 0.3;
     goal_check_flg = false;
     path_index_size = 0;
     search_path_window = 100;
     current_way = 0;
+    //sample num
     K = 100;
     window_size = 10;
+    //step horizon num
     time_horizon_T = 30;
     prev_waypoints_idx = 0;
+
     //----- init vector----- 
     input_U.resize(time_horizon_T);
     optimal_U.resize(time_horizon_T);
@@ -67,26 +73,24 @@ MPPIPlanner::MPPIPlanner()
 }
 
 //---------callback-------------
-// void MPPIPlanner::amcl_callback(const geometry_msgs::PoseWithCovarianceStampedConstPtr &msg)
-// {
-//     current_pose = msg ->pose.pose;
-//     ROS_INFO("pose received!!:");
+void MPPIPlanner::amcl_callback(const geometry_msgs::PoseWithCovarianceStampedConstPtr &msg)
+{
+    current_pose = msg ->pose.pose;
+    // ROS_INFO("pose received!!:");
 
-//     // watch later
-// }
+}
 void MPPIPlanner::model_callback(const gazebo_msgs::ModelStatesConstPtr &msg)
 {
     current_pose = msg->pose[2];
-    ROS_INFO("pose received!!:");
+    // ROS_INFO("pose received!!:");
 
 }
 
 void MPPIPlanner::path_callback(const nav_msgs::PathConstPtr &msg){
     goal_path.poses = msg->poses;
     path_index_size = goal_path.poses.size();
-
     ROS_INFO("path call!!:num%d",path_index_size);
-    start_call = true;
+    path_receive_flg = true;
     
 }
 
@@ -103,7 +107,6 @@ void MPPIPlanner::target_point_callback(const geometry_msgs::PoseStampedConstPtr
 
 }
 //---------function-------------
-// void MPPIPlanner::state_transition(const geometry_msgs::Pose &pose, const Eigen::VectorXd &v){//F(Xt,vt)
 //F(Xt,vt) 
 geometry_msgs::Pose MPPIPlanner::state_transition(geometry_msgs::Pose pose, const vec2_t &vt){//F(Xt,vt)
     theta = tf2::getYaw(pose.orientation);
@@ -131,30 +134,21 @@ geometry_msgs::Pose MPPIPlanner::state_transition(geometry_msgs::Pose pose, cons
 }
 
 vec2_t MPPIPlanner::clamp_input(vec2_t &input_control, double &vel_max, double &vel_min, double &omega_lim) {
-    // std::cout <<"in[0]" << input_control[0] << "in[1]" << input_control[1] << std::endl ;
     input_control[0] = std::max(std::min(input_control[0], vel_max), vel_min);
     input_control[1] = std::max(std::min(input_control[1], omega_lim), (-omega_lim));
-    // std::cout <<"clamp"<< std::endl ;
-    // std::cout <<"in_cla[0]" << input_control[0] << "in_cla[1]" << input_control[1] << std::endl ;
     return input_control;
 
 }
 
 vec2_t MPPIPlanner::sample_noise(const vec2_t& mean_vec, const mat_t & cov){
-    // vec2_t mean_vec;
-    //mean_vec << mean[0],mean[1];
-
     std::mt19937 engine((std::random_device())());
     std::normal_distribution<> dist(0.0, 1.0);
     Eigen::LLT<Eigen::MatrixXd> llt(cov);
     Eigen::MatrixXd L = llt.matrixL();
     vec2_t n;
-    // for (int i = 0; i < n.size(); ++i)
     for (size_t i = 0; i < 2; ++i)
     {
         n(i) = dist(engine);
-        // std::cout << "i:" << i << std::endl;
-    // epsilon = L*n;
     }
     return L * n; //[v_epsilon,omega_epsilon]
 }
@@ -178,7 +172,6 @@ vec2_t MPPIPlanner::sample_noise(const vec2_t& mean_vec, const mat_t & cov){
 // }//return Vt
    
 
-// calculate stage cost:S
 
 bool MPPIPlanner::goal_check(){
     bool check_flg;
@@ -186,7 +179,7 @@ bool MPPIPlanner::goal_check(){
     dist = std::sqrt(std::pow(current_pose.position.x - goal_check_pose.pose.position.x, 2) + 
                     std::pow(current_pose.position.y - goal_check_pose.pose.position.y, 2));
     // std::cout << dist << std::endl;
-    if (goal_threshold >= dist)
+    if (goal_threshold > dist)
     {
         check_flg = true;
         ROS_INFO("reach GOAL!!!");
@@ -199,70 +192,58 @@ bool MPPIPlanner::goal_check(){
 }
 int MPPIPlanner::search_path_index(const geometry_msgs::Pose &pose ,bool update_prev_idx){
         
-        int search_index_len = std::min(50,path_index_size-prev_waypoints_idx);
-        // std::cout << "len:" << search_index_len << std::endl;
+        // int search_index_len = std::min(50,path_index_size-prev_waypoints_idx);
+        int search_index_len = 50;
+        // std::cout << "len:" << path_index_size << std::endl;
         int prev_idx = prev_waypoints_idx;
         double dist = 0.0;
-        double old_dist = 1000;
-        int min_d;
         std::vector<double>dist_list;
         dist_list.resize(prev_idx+search_index_len);
+        // dist_list.resize(path_index_size);
         // if(path_index_size < search_path_window)
         // {
         //     search_path_window = path_index_size;
         // }
         // for(int i=current_way; i<search_path_window; i++)
+    // #pragma omp parallel for schedule(dynamic)    
         for(int i=prev_idx; i<prev_idx+search_index_len; ++i)
         {
             // std::cout << "search:" << i << std::endl;
             double dx = std::pow((pose.position.x - goal_path.poses[i].pose.position.x),2);
-            double dy = std::pow((pose.position.y - goal_path.poses[i].pose.position.y),2);
-            
-            // double dy = pose.position.y - goal_path.poses[i].pose.position.y;
-            dist = dx  + dy ;
-            // dist = std::sqrt(std::pow(pose.position.x - goal_path.poses[i].pose.position.x, 2) + 
-                    // std::pow(current_pose.position.y - goal_path.poses[i].pose.position.y, 2));
-            dist_list[i] = dist;
-            // std::cout <<"dist:"<< dist<< std::endl ;
-
+            double dy = std::pow((pose.position.y - goal_path.poses[i].pose.position.y),2);            
+            // dist = dx  + dy ;
+            dist_list[i] = dx + dy;
+            // std::cout << "dist_list" << dist_list[i] << std::endl;
         }
-        min_d = std::distance(dist_list.begin(), 
+    
+
+       
+        int min_d = std::distance(dist_list.begin(), 
                 std::min_element(dist_list.begin(),dist_list.end()));
-        int nearest_idx = min_d + prev_idx;
+        // std::cout << "min_d:" << min_d << std::endl;
+        // std::cout << "prev_idx:" << prev_idx << std::endl;
+        int nearest_idx = min_d + prev_idx; 
+        
         // double ref_x =  goal_path.poses[nearest_idx].pose.position.x;
         // double ref_y =  goal_path.poses[nearest_idx].pose.position.y;
             // if(dist <= old_dist){
             //     old_dist = dist;
             //     near_way_index = i;
             // }
+
         if(update_prev_idx)
-            prev_waypoints_idx = nearest_idx;
-            // std::cout <<"way:"<< prev_waypoints_idx<< std::endl ;
+            // nearest_idx =  search_index_len;
+            // if(path_index_size < nearest_idx)
+            //     nearest_idx = path_index_size;
+            prev_waypoints_idx = nearest_idx+1;
+            if(path_index_size <= prev_waypoints_idx)
+                prev_waypoints_idx = nearest_idx;
+
+            // std::cout <<"update way:"<< prev_waypoints_idx<< std::endl ;
         // std::cout << "len end:" << search_index_len << std::endl;
 
         return nearest_idx;
     }
-
-double MPPIPlanner::calc_terminal_cost(const geometry_msgs::Pose& pose)
-{
-    double cost_phi = 0;
-    // int near_way_index_phi = current_way_phi;
-    // near_way_index_phi = search_path_index(pose);
-    // cost_phi = std::sqrt(std::pow(pose.position.x - goal_path.poses[near_way_index_phi].pose.position.x , 2) + 
-                    //  std::pow(pose.position.y - goal_path.poses[near_way_index_phi].pose.position.y, 2));
-    // cost_phi = std::sqrt(std::pow(pose.position.x - goal_check_pose.pose.position.x , 2) + 
-                // std::pow(pose.position.y - goal_check_pose.pose.position.y, 2));
-    // int near_way_index_phi = search_path_index(pose,false);
-
-    // cost_phi = 1.0*std::pow((pose.position.x - goal_path.poses[near_way_index_phi].pose.position.x),2) + 
-    //             1.0*std::pow((pose.position.y - goal_path.poses[near_way_index_phi].pose.position.y),2); 
-    cost_phi = 1.0*std::pow((pose.position.x - goal_check_pose.pose.position.x),2) + 
-                1.0*std::pow((pose.position.y - goal_check_pose.pose.position.y),2); 
-    // std::cout << "phi:"<<cost_phi << std::endl;
-    // current_way_phi = near_way_index_phi;
-    return cost_phi;
-}
-
 double MPPIPlanner::calc_trajectory_cost(const geometry_msgs::Pose& pose)
 {
     // int near_way_index_tra = current_way_c;
@@ -273,16 +254,32 @@ double MPPIPlanner::calc_trajectory_cost(const geometry_msgs::Pose& pose)
                     //  std::pow(pose.position.y - goal_path.poses[near_way_index_tra].pose.position.y, 2));
     // cost_c = std::sqrt(std::pow(pose.position.x - goal_check_pose.pose.position.x , 2) + 
                     // std::pow(pose.position.y - goal_check_pose.pose.position.y, 2));
-    // int near_way_index_c = search_path_index(pose,false);
+    int near_way_index_c = search_path_index(pose,false);
 
-    // cost_c = 1.0*std::pow((pose.position.x - goal_path.poses[near_way_index_c].pose.position.x),2) + 
-                // 0.5*std::pow((pose.position.y - goal_path.poses[near_way_index_c].pose.position.y),2); 
-    cost_c = 1.0*std::pow((pose.position.x - goal_check_pose.pose.position.x),2) + 
-                1.0*std::pow((pose.position.y - goal_check_pose.pose.position.y),2); 
+    cost_c = 1.0*std::pow((pose.position.x - goal_path.poses[near_way_index_c].pose.position.x),2) + 
+                2.0*std::pow((pose.position.y - goal_path.poses[near_way_index_c].pose.position.y),2); 
+    // cost_c += 1.0*std::pow((pose.position.x - goal_check_pose.pose.position.x),2) + 
+                // 1.0*std::pow((pose.position.y - goal_check_pose.pose.position.y),2); 
 
     // current_way_c = near_way_index_tra;
     return cost_c;
 }
+double MPPIPlanner::calc_terminal_cost(const geometry_msgs::Pose& pose)
+{
+    double cost_phi = 0;
+    int near_way_index_phi = search_path_index(pose,false);
+
+    cost_phi = 1.0*std::pow((pose.position.x - goal_path.poses[near_way_index_phi].pose.position.x),2) + 
+                2.0*std::pow((pose.position.y - goal_path.poses[near_way_index_phi].pose.position.y),2); 
+
+    // cost_phi += 1.0*std::pow((pose.position.x - goal_check_pose.pose.position.x),2) + 
+                // 1.0*std::pow((pose.position.y - goal_check_pose.pose.position.y),2); 
+    // std::cout << "phi:"<<cost_phi << std::endl;
+    // current_way_phi = near_way_index_phi;
+    return cost_phi;
+}
+
+
 //Algorithm 2: Information Theoretic Weight Computation 
 // std::vector<double> MPPIPlanner::calc_weights(std::vector<Series_eig> V){
 std::vector<double> MPPIPlanner::calc_weights(std::vector<double> &Stage_cost){
@@ -297,7 +294,7 @@ std::vector<double> MPPIPlanner::calc_weights(std::vector<double> &Stage_cost){
 
     // rho = *std::min_element(Stage_cost.begin(),Stage_cost.end());
     // std::cout << "rho:"<< rho << std::endl;
-
+#pragma omp parallel for reduction(+ : eta) schedule(dynamic)
     for(const auto& c:Stage_cost){
     // for(size_t k=0;k<K;++k){
         eta += std::exp(-inv_lambda*(c-rho));
@@ -306,11 +303,10 @@ std::vector<double> MPPIPlanner::calc_weights(std::vector<double> &Stage_cost){
     }
     // std::cout << "eta:"<< eta << std::endl;
     double inv_eta = 1.0/eta;
-
+// #pragma omp parallel for schedule(dynamic)
     // w[] = (1/eta) * std::exp((-1/lambda)*inv_sigma)
     for(size_t k=0;k<K;++k){
         weight[k] = inv_eta * std::exp(-inv_lambda*(Stage_cost[k]-rho));
-        std::cout << "debug" << std::endl;
     
         // std::cout << "weight:"<< weight[k] << std::endl;
     }
@@ -322,6 +318,7 @@ std::vector<vec2_t> MPPIPlanner::moving_average(const std::vector<vec2_t>& xx,
     const size_t n = xx.size();
     std::vector<vec2_t> xx_mean(n, vec2_t::Zero(2, 1));
     std::vector<double> window(window_size, 1.0 / window_size);
+    
     for (size_t d = 0; d < 2; ++d) {
         std::vector<double> temp(n + window_size - 1, 0.0);
         // Padding the temp array with the first and last values
@@ -346,19 +343,15 @@ std::vector<vec2_t> MPPIPlanner::moving_average(const std::vector<vec2_t>& xx,
 //main function
 void MPPIPlanner::calc_optical_control_input(){
 //calculate optimal input U
-    // std::vector<Series_eig> V_(K, Series_eig(time_horizon_T));
     vec2_t v = vec2_t::Zero();
     trajectory_path.poses.resize(time_horizon_T);
     X_t = current_pose; //set current pose X
-    // state_pose = X; //set current pose X
 
     input_U = optimal_U; // set prev control input u
     std::cout << "size" << input_U.size() << std::endl;
     goal_check_flg = goal_check(); 
     // path_index_size = goal_path.poses.size();
-    // current_way = 0;
-    // current_way_c = 0;
-    // current_way_phi = 0;
+  
     visualization_msgs::Marker way_marker;
     way_marker.header.frame_id = "map";
     way_marker.header.stamp = ros::Time::now();
@@ -367,21 +360,26 @@ void MPPIPlanner::calc_optical_control_input(){
     way_marker.id = 0;
     way_marker.action = visualization_msgs::Marker::ADD;
     way_marker.lifetime = ros::Duration();
-    if(start_call && goal_check_flg == false){
+    if(start_call && path_receive_flg && !goal_check_flg){
         // std::cout <<  goal_check_flg << std::endl;
-        // search_path_index(current_pose,true);
-        // std::cout <<"way:"<< prev_waypoints_idx<< std::endl ;
+        search_path_index(X_t,true);
+        std::cout <<"way:"<< prev_waypoints_idx<< std::endl ;
+        if(prev_waypoints_idx >= path_index_size){
+            std::cout <<"Reached the end of the reference path"<< std::endl ;
+        }
 
         geometry_msgs::PoseStamped tra_pose_;
         nav_msgs::Path sample_path;
         sample_path.header.stamp = ros::Time::now();
         sample_path.header.frame_id = "map";
         sample_path.poses.clear();
-
+        // std::cout << "debug" << std::endl;
+        // #pragma omp parallel for schedule(dynamic)
         for(size_t k = 0;k<K;++k){
             X = X_t;
             S_cost[k] = 0.0;
             // current_way_c = current_way;
+            
             for(size_t t = 1;t<time_horizon_T+1;++t){
                 epsilon_[k][t-1] = sample_noise(input_U[t-1],sigma);
                 // std::cout <<"epsilon:" <<k <<":"<<t<<":"<< epsilon_[k][t-1] << std::endl;
@@ -395,65 +393,56 @@ void MPPIPlanner::calc_optical_control_input(){
                     v = epsilon_[k][t-1];
                 v = clamp_input(v, max_vel, min_vel, max_omega);
                 V[k][t-1] = v;
-                // V[k][t-1] = clamp_input(v, max_vel, min_vel, max_omega);
 
-                // trajectory_pose = 
-                        // state_transition(trajectory_pose, V[k][t-1]);
                 X = state_transition(X, v);
-                // std::cout<<"v:" <<v.transpose() << std::endl;
                 //calculate stage cost c
-                // S_cost[k] += calc_trajectory_cost(trajectory_pose) + gamma 
-                                // * input_U[t-1].transpose() *inv_sigma *v;
                 S_cost[k] += calc_trajectory_cost(X) + gamma 
                                 * input_U[t-1].transpose() *inv_sigma *v;
-                // std::cout <<"V["<< k <<"]"<< V_[k].controls[t]<< std::endl ;
-                // trajectory_pose
-                //  = trajectory_path.poses[t].pose;
+                
                 // geometry_msgs::PoseStamped pose_stamped;
                 tra_pose_.header.stamp = ros::Time::now();
                 tra_pose_.header.frame_id = "map";
                 tra_pose_.pose.position.x = X.position.x;
-                tra_pose_.pose.position.y = X.position.x;
+                tra_pose_.pose.position.y = X.position.y;
                 tra_pose_.pose.position.z = 0;
-                // sample_path.poses.push_back(tra_pose_);
+                sample_path.poses.push_back(tra_pose_);
             }
-            // current_way_phi = current_way_c;
-            // S_cost[k] += calc_terminal_cost(trajectory_path.poses.back().pose);
             //calculate terminal cost phi
-
             S_cost[k] += calc_terminal_cost(X);
             // std::cout<<"t_phi:" <<trajectory_pose << std::endl;
-            // sampled_path_pub_.publish(sample_path);
+            sampled_path_pub_.publish(sample_path);
             // std::cout <<"S["<< k <<"]"<< S[k]<< std::endl ;
         }
 
         weight_ = calc_weights(S_cost);
+        // search_path_index(X_t,true);
 
         // current_way = current_way_phi;
-        // way_marker.pose.position.x = goal_path.poses[prev_waypoints_idx].pose.position.x;
-        // way_marker.pose.position.y = goal_path.poses[prev_waypoints_idx].pose.position.y;
-        // // way_marker.pose.position.x = goal_check_pose.pose.position.x;
-        // // way_marker.pose.position.y = goal_check_pose.pose.position.y;
-        // way_marker.pose.position.z = 0.0;
-        // way_marker.pose.orientation.x = 0;
-        // way_marker.pose.orientation.y = 0;
-        // way_marker.pose.orientation.z = 0;
-        // way_marker.pose.orientation.w = 1;
-        // way_marker.color.r  = 1.0;
-        // way_marker.color.g  = 0.0;
-        // way_marker.color.b  = 0.0;
-        // way_marker.color.a  = 1.0;
+        way_marker.pose.position.x = goal_path.poses[prev_waypoints_idx].pose.position.x;
+        way_marker.pose.position.y = goal_path.poses[prev_waypoints_idx].pose.position.y;
+        // way_marker.pose.position.x = goal_check_pose.pose.position.x;
+        // way_marker.pose.position.y = goal_check_pose.pose.position.y;
+        way_marker.pose.position.z = 0.0;
+        way_marker.pose.orientation.x = 0;
+        way_marker.pose.orientation.y = 0;
+        way_marker.pose.orientation.z = 0;
+        way_marker.pose.orientation.w = 1;
+        way_marker.color.r  = 0.0;
+        way_marker.color.g  = 0.0;
+        way_marker.color.b  = 1.0;
+        way_marker.color.a  = 1.0;
 
-        // way_marker.scale.x = 0.1;
-        // way_marker.scale.y = 0.1;
-        // way_marker.scale.z = 0.1;
-        // waypoint_pub.publish(way_marker);
+        way_marker.scale.x = 0.1;
+        way_marker.scale.y = 0.1;
+        way_marker.scale.z = 0.1;
+        waypoint_pub.publish(way_marker);
 
 
         // std::cout << "optim" << std::endl;
         std::vector<geometry_msgs::PoseStamped> u_path;
         geometry_msgs::PoseStamped optim_pose;
         nav_msgs::Path visual_path;
+    // #pragma omp parallel for schedule(dynamic)
         for(int t = 0;t<time_horizon_T;++t){
             w_epsilon[t] = vec2_t::Zero(2,1);
             for(int k = 0;k<K;++k){
@@ -461,13 +450,14 @@ void MPPIPlanner::calc_optical_control_input(){
             }
         }
         w_epsilon = moving_average(w_epsilon,window_size=10);
-        // trajectory_pose = state_pose;
         geometry_msgs::PoseStamped pose_stamped;
         nav_msgs::Path path;
         path.header.stamp = ros::Time::now();
         path.header.frame_id = "map";
         path.poses.clear();
+        //update X pose
         X = X_t;
+
         for (size_t t = 0; t< time_horizon_T; ++t){
             input_U[t] += w_epsilon[t];
             input_U[t] = clamp_input(input_U[t], max_vel, min_vel, max_omega);
@@ -494,6 +484,9 @@ void MPPIPlanner::calc_optical_control_input(){
         std::cout << "please start call or goal now" << std::endl;
         optim_control.linear.x =  0.0;
         optim_control.angular.z = 0.0;
+        for (int i=0;i<time_horizon_T;i++){
+            input_U[i] = vec2_t::Zero(2,1);
+        }   
         optim_velocity_pub_.publish(optim_control);
     }
 }
